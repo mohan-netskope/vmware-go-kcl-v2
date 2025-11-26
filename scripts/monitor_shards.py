@@ -7,7 +7,6 @@ Press Ctrl+C to stop.
 """
 
 import argparse
-import os
 import sys
 import time
 from datetime import datetime
@@ -18,6 +17,8 @@ try:
     from boto3.dynamodb.types import TypeDeserializer
 except ImportError:
     print("Error: boto3 is required. Install with: pip install boto3")
+    boto3 = None  # type: ignore[assignment]
+    TypeDeserializer = None  # type: ignore[assignment]
     sys.exit(1)
 
 try:
@@ -25,6 +26,7 @@ try:
     HAS_TABULATE = True
 except ImportError:
     HAS_TABULATE = False
+    tabulate = None  # type: ignore[assignment]
 
 
 # DynamoDB attribute keys (matching Go constants)
@@ -33,11 +35,6 @@ LEASE_OWNER_KEY = "AssignedTo"
 STICKY_OWNER_KEY = "StickyOwner"
 SEQUENCE_NUMBER_KEY = "Checkpoint"
 LEASE_TIMEOUT_KEY = "LeaseTimeout"
-
-
-def clear_screen():
-    """Clear the terminal screen."""
-    os.system('clear' if os.name != 'nt' else 'cls')
 
 
 def format_checkpoint(checkpoint: Optional[str]) -> str:
@@ -71,24 +68,47 @@ def format_lease_timeout(timeout: Optional[str]) -> str:
 def scan_dynamodb_table(dynamodb_client, table_name: str) -> List[Dict]:
     """Scan DynamoDB table and return lease information."""
     deserializer = TypeDeserializer()
-    
+
     try:
         response = dynamodb_client.scan(
             TableName=table_name,
             ProjectionExpression=f"{LEASE_KEY_KEY},{LEASE_OWNER_KEY},{STICKY_OWNER_KEY},{SEQUENCE_NUMBER_KEY},{LEASE_TIMEOUT_KEY}",
             Select='SPECIFIC_ATTRIBUTES'
         )
-        
+
         items = []
         for item in response.get('Items', []):
             # Deserialize DynamoDB item
             deserialized = {k: deserializer.deserialize(v) for k, v in item.items()}
             items.append(deserialized)
-        
+
         return items
+    except getattr(dynamodb_client, 'exceptions', object()).ResourceNotFoundException:  # type: ignore[attr-defined]
+        print(f"\nError: DynamoDB table '{table_name}' not found.")
+        list_available_tables(dynamodb_client)
+        sys.exit(1)
     except Exception as e:
         print(f"Error scanning table: {e}")
         return []
+
+
+def list_available_tables(dynamodb_client):
+    """List available DynamoDB tables to help users pick the right one."""
+    try:
+        print("\nAvailable DynamoDB tables:")
+        paginator = dynamodb_client.get_paginator('list_tables')
+        tables = []
+        for page in paginator.paginate():
+            tables.extend(page.get('TableNames', []))
+
+        if not tables:
+            print("  (none found)")
+        else:
+            for name in sorted(tables):
+                print(f"  - {name}")
+        print(f"\nTotal tables: {len(tables)}")
+    except Exception as e:
+        print(f"Unable to list tables: {e}")
 
 
 def display_shard_assignments(items: List[Dict], use_tabulate: bool = True):
@@ -165,8 +185,6 @@ def monitor_loop(args):
     
     try:
         while True:
-            clear_screen()
-            
             # Display timestamp
             print(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             
@@ -223,4 +241,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

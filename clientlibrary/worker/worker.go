@@ -327,11 +327,15 @@ func (w *Worker) eventLoop() {
 					continue
 				}
 
-				// Skip sticky shards that belong to other workers
+				// Skip sticky shards that belong to other workers, unless their lease has expired
 				stickyOwner := shard.GetStickyOwner()
 				if stickyOwner != "" && stickyOwner != w.workerID {
-					log.Debugf("Skipping shard %s (sticky to worker %s)", shard.ID, stickyOwner)
-					continue
+					// Check if the sticky owner's lease has expired - if so, allow temporary takeover
+					if time.Now().UTC().Before(shard.GetLeaseTimeout()) {
+						log.Debugf("Skipping shard %s (sticky to worker %s, lease active)", shard.ID, stickyOwner)
+						continue
+					}
+					log.Debugf("Shard %s is sticky to worker %s but lease expired, attempting temporary takeover", shard.ID, stickyOwner)
 				}
 
 				var stealShard bool

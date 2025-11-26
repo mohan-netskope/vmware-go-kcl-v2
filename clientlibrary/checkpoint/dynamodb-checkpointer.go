@@ -144,6 +144,19 @@ func (checkpointer *DynamoCheckpoint) GetLease(shard *par.ShardStatus, newAssign
 		stickyOwner := stickyOwnerVar.(*types.AttributeValueMemberS).Value
 		if stickyOwner != "" && stickyOwner != newAssignTo {
 			// This shard has a sticky owner and it's not the current worker
+			// Check if this is a lease renewal by a temporary holder
+			assignedVar, assignedToOk := currentCheckpoint[LeaseOwnerKey]
+			if assignedToOk {
+				currentAssignee := assignedVar.(*types.AttributeValueMemberS).Value
+				if currentAssignee == newAssignTo {
+					// This is a temporary holder trying to renew the lease
+					// Don't allow renewal - let the lease expire so sticky owner can reclaim
+					checkpointer.log.Infof("Shard %s is sticky to worker %s. Temporary holder %s will not renew lease to allow sticky owner to reclaim",
+						shard.ID, stickyOwner, newAssignTo)
+					return ErrLeaseNotAcquired{"temporary holder cannot renew lease for shard with sticky owner"}
+				}
+			}
+
 			// Check if the sticky owner's lease has expired beyond FailoverTimeMillis
 			leaseVar, leaseTimeoutOk := currentCheckpoint[LeaseTimeoutKey]
 			if leaseTimeoutOk {
@@ -245,8 +258,13 @@ func (checkpointer *DynamoCheckpoint) GetLease(shard *par.ShardStatus, newAssign
 	}
 
 	// Preserve StickyOwner from currentCheckpoint if present
+	// Also set it on the shard object so CheckpointSequence can access it later
 	if stickyOwnerVar, hasStickyOwner := currentCheckpoint[StickyOwnerKey]; hasStickyOwner {
+		stickyOwnerValue := stickyOwnerVar.(*types.AttributeValueMemberS).Value
 		marshalledCheckpoint[StickyOwnerKey] = stickyOwnerVar
+		if stickyOwnerValue != "" {
+			shard.SetStickyOwner(stickyOwnerValue)
+		}
 	}
 
 	if checkpointer.kclConfig.EnableLeaseStealing {
