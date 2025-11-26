@@ -139,6 +139,44 @@ func (checkpointer *DynamoCheckpoint) GetLease(shard *par.ShardStatus, newAssign
 		return err
 	}
 
+	// Check for sticky owner assignment
+	if stickyOwnerVar, hasStickyOwner := currentCheckpoint[StickyOwnerKey]; hasStickyOwner {
+		stickyOwner := stickyOwnerVar.(*types.AttributeValueMemberS).Value
+		if stickyOwner != "" && stickyOwner != newAssignTo {
+			// This shard has a sticky owner and it's not the current worker
+			// Check if this is a lease renewal by a temporary holder
+			assignedVar, assignedToOk := currentCheckpoint[LeaseOwnerKey]
+			if assignedToOk {
+				currentAssignee := assignedVar.(*types.AttributeValueMemberS).Value
+				if currentAssignee == newAssignTo {
+					// This is a temporary holder trying to renew the lease
+					// Don't allow renewal - let the lease expire so sticky owner can reclaim
+					checkpointer.log.Infof("Shard %s is sticky to worker %s. Temporary holder %s will not renew lease to allow sticky owner to reclaim",
+						shard.ID, stickyOwner, newAssignTo)
+					return ErrLeaseNotAcquired{"temporary holder cannot renew lease for shard with sticky owner"}
+				}
+			}
+
+			// Check if the sticky owner's lease has expired beyond FailoverTimeMillis
+			leaseVar, leaseTimeoutOk := currentCheckpoint[LeaseTimeoutKey]
+			if leaseTimeoutOk {
+				leaseTimeout := leaseVar.(*types.AttributeValueMemberS).Value
+				currentLeaseTimeout, err := time.Parse(time.RFC3339Nano, leaseTimeout)
+				if err != nil {
+					return err
+				}
+				// Allow temporary takeover only if lease has been expired for the full failover time
+				if time.Now().UTC().Before(currentLeaseTimeout) {
+					checkpointer.log.Debugf("Shard %s is sticky to worker %s (lease not expired). Denying lease to %s",
+						shard.ID, stickyOwner, newAssignTo)
+					return ErrLeaseNotAcquired{"shard has sticky owner with active lease"}
+				}
+				checkpointer.log.Warnf("Shard %s is sticky to worker %s but lease expired. Allowing temporary takeover by %s",
+					shard.ID, stickyOwner, newAssignTo)
+			}
+		}
+	}
+
 	isClaimRequestExpired := shard.IsClaimRequestExpired(checkpointer.kclConfig)
 
 	var claimRequest string
@@ -219,6 +257,16 @@ func (checkpointer *DynamoCheckpoint) GetLease(shard *par.ShardStatus, newAssign
 		}
 	}
 
+	// Preserve StickyOwner from currentCheckpoint if present
+	// Also set it on the shard object so CheckpointSequence can access it later
+	if stickyOwnerVar, hasStickyOwner := currentCheckpoint[StickyOwnerKey]; hasStickyOwner {
+		stickyOwnerValue := stickyOwnerVar.(*types.AttributeValueMemberS).Value
+		marshalledCheckpoint[StickyOwnerKey] = stickyOwnerVar
+		if stickyOwnerValue != "" {
+			shard.SetStickyOwner(stickyOwnerValue)
+		}
+	}
+
 	if checkpointer.kclConfig.EnableLeaseStealing {
 		if claimRequest != "" && claimRequest == newAssignTo && !isClaimRequestExpired {
 			if expressionAttributeValues == nil {
@@ -270,6 +318,11 @@ func (checkpointer *DynamoCheckpoint) CheckpointSequence(shard *par.ShardStatus)
 		marshalledCheckpoint[ParentShardIdKey] = &types.AttributeValueMemberS{Value: shard.ParentShardId}
 	}
 
+	// Preserve StickyOwner if present
+	if stickyOwner := shard.GetStickyOwner(); stickyOwner != "" {
+		marshalledCheckpoint[StickyOwnerKey] = &types.AttributeValueMemberS{Value: stickyOwner}
+	}
+
 	return checkpointer.saveItem(marshalledCheckpoint)
 }
 
@@ -290,6 +343,11 @@ func (checkpointer *DynamoCheckpoint) FetchCheckpoint(shard *par.ShardStatus) er
 
 	if assignedTo, ok := checkpoint[LeaseOwnerKey]; ok {
 		shard.SetLeaseOwner(assignedTo.(*types.AttributeValueMemberS).Value)
+	}
+
+	// Load sticky owner if present
+	if stickyOwner, ok := checkpoint[StickyOwnerKey]; ok {
+		shard.SetStickyOwner(stickyOwner.(*types.AttributeValueMemberS).Value)
 	}
 
 	// Use up-to-date leaseTimeout to avoid ConditionalCheckFailedException when claiming
@@ -426,6 +484,11 @@ func (checkpointer *DynamoCheckpoint) ClaimShard(shard *par.ShardStatus, claimID
 		expressionAttributeValues[":assigned_to"] = &types.AttributeValueMemberS{Value: leaseOwner}
 	}
 
+	// Preserve StickyOwner if present
+	if stickyOwner := shard.GetStickyOwner(); stickyOwner != "" {
+		marshalledCheckpoint[StickyOwnerKey] = &types.AttributeValueMemberS{Value: stickyOwner}
+	}
+
 	if checkpoint := shard.GetCheckpoint(); checkpoint == "" {
 		conditionalExpression += " AND attribute_not_exists(Checkpoint)"
 	} else if checkpoint == ShardEnd {
@@ -447,6 +510,21 @@ func (checkpointer *DynamoCheckpoint) ClaimShard(shard *par.ShardStatus, claimID
 	return checkpointer.conditionalUpdate(conditionalExpression, expressionAttributeValues, marshalledCheckpoint)
 }
 
+// GetStickyOwner returns the sticky owner for the given shard
+func (checkpointer *DynamoCheckpoint) GetStickyOwner(shardID string) (string, error) {
+	currentCheckpoint, err := checkpointer.getItem(shardID)
+	if err != nil {
+		return "", err
+	}
+
+	stickyOwner, ok := currentCheckpoint[StickyOwnerKey]
+	if !ok {
+		return "", nil
+	}
+
+	return stickyOwner.(*types.AttributeValueMemberS).Value, nil
+}
+
 func (checkpointer *DynamoCheckpoint) syncLeases(shardStatus map[string]*par.ShardStatus) error {
 	log := checkpointer.kclConfig.Logger
 
@@ -456,7 +534,7 @@ func (checkpointer *DynamoCheckpoint) syncLeases(shardStatus map[string]*par.Sha
 
 	checkpointer.lastLeaseSync = time.Now()
 	input := &dynamodb.ScanInput{
-		ProjectionExpression: aws.String(fmt.Sprintf("%s,%s,%s", LeaseKeyKey, LeaseOwnerKey, SequenceNumberKey)),
+		ProjectionExpression: aws.String(fmt.Sprintf("%s,%s,%s,%s", LeaseKeyKey, LeaseOwnerKey, SequenceNumberKey, StickyOwnerKey)),
 		Select:               "SPECIFIC_ATTRIBUTES",
 		TableName:            aws.String(checkpointer.kclConfig.TableName),
 	}
@@ -480,6 +558,11 @@ func (checkpointer *DynamoCheckpoint) syncLeases(shardStatus map[string]*par.Sha
 		if shard, ok := shardStatus[shardId.(*types.AttributeValueMemberS).Value]; ok {
 			shard.SetLeaseOwner(assignedTo.(*types.AttributeValueMemberS).Value)
 			shard.SetCheckpoint(checkpoint.(*types.AttributeValueMemberS).Value)
+
+			// Load sticky owner if present
+			if stickyOwner, hasStickyOwner := result[StickyOwnerKey]; hasStickyOwner {
+				shard.SetStickyOwner(stickyOwner.(*types.AttributeValueMemberS).Value)
+			}
 		}
 	}
 

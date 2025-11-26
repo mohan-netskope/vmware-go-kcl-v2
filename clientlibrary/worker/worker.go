@@ -327,6 +327,17 @@ func (w *Worker) eventLoop() {
 					continue
 				}
 
+				// Skip sticky shards that belong to other workers, unless their lease has expired
+				stickyOwner := shard.GetStickyOwner()
+				if stickyOwner != "" && stickyOwner != w.workerID {
+					// Check if the sticky owner's lease has expired - if so, allow temporary takeover
+					if time.Now().UTC().Before(shard.GetLeaseTimeout()) {
+						log.Debugf("Skipping shard %s (sticky to worker %s, lease active)", shard.ID, stickyOwner)
+						continue
+					}
+					log.Debugf("Shard %s is sticky to worker %s but lease expired, attempting temporary takeover", shard.ID, stickyOwner)
+				}
+
 				var stealShard bool
 				if w.kclConfig.EnableLeaseStealing && shard.ClaimRequest != "" {
 					upcomingStealingInterval := time.Now().UTC().Add(time.Duration(w.kclConfig.LeaseStealingIntervalMillis) * time.Millisecond)
@@ -448,12 +459,30 @@ func (w *Worker) rebalance() error {
 		return nil
 	}
 
-	// Steal a random shard from the worker with the most shards
+	// Filter out sticky shards from the list of stealable shards
+	var nonStickyShards []*par.ShardStatus
+	for _, shard := range workers[workerSteal] {
+		stickyOwner := shard.GetStickyOwner()
+		if stickyOwner == "" {
+			// Not a sticky shard, can be stolen
+			nonStickyShards = append(nonStickyShards, shard)
+		} else {
+			log.Debugf("Shard %s is sticky to worker %s, excluding from steal consideration", shard.ID, stickyOwner)
+		}
+	}
+
+	// If all shards of the target worker are sticky, we can't steal any
+	if len(nonStickyShards) == 0 {
+		log.Debugf("All shards of worker %s are sticky, not stealing any. workerID: %s", workerSteal, w.workerID)
+		return nil
+	}
+
+	// Steal a random non-sticky shard from the worker with the most shards
 	w.shardStealInProgress = true
-	rnd, _ := rand.Int(rand.Reader, big.NewInt(int64(len(workers[workerSteal]))))
+	rnd, _ := rand.Int(rand.Reader, big.NewInt(int64(len(nonStickyShards))))
 	randIndex := int(rnd.Int64())
-	shardToSteal := workers[workerSteal][randIndex]
-	log.Debugf("Stealing shard %s from %s", shardToSteal, workerSteal)
+	shardToSteal := nonStickyShards[randIndex]
+	log.Debugf("Stealing shard %s from %s", shardToSteal.ID, workerSteal)
 
 	err = w.checkpointer.ClaimShard(w.shardStatus[shardToSteal.ID], w.workerID)
 	if err != nil {

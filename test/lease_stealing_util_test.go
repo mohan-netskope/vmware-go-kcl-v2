@@ -222,8 +222,26 @@ func (tc *TestCluster) SpawnWorker() (string, *wk.Worker) {
 	return workerID, worker
 }
 
+// SpawnWorkerWithID spawns a worker with a specific worker ID
+// This is useful for testing sticky shard reclaim where the worker ID must match
+func (tc *TestCluster) SpawnWorkerWithID(workerID string) (string, *wk.Worker) {
+	config := tc.workerFactory.CreateKCLConfig(workerID, tc.config)
+	worker := tc.addWorker(workerID, config)
+
+	err := worker.Start()
+	assert.Nil(tc.t, err)
+	return workerID, worker
+}
+
 func (tc *TestCluster) Shutdown() {
 	for workerID, worker := range tc.workers {
+		tc.t.Logf("Shutting down worker: %v", workerID)
+		worker.Shutdown()
+	}
+}
+
+func (tc *TestCluster) ShutdownWorker(workerID string) {
+	if worker, ok := tc.workers[workerID]; ok {
 		tc.t.Logf("Shutting down worker: %v", workerID)
 		worker.Shutdown()
 	}

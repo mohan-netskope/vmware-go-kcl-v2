@@ -41,6 +41,7 @@ type ShardStatus struct {
 	ParentShardId string
 	Checkpoint    string
 	AssignedTo    string
+	StickyOwner   string
 	Mux           *sync.RWMutex
 	LeaseTimeout  time.Time
 	// Shard Range
@@ -93,4 +94,16 @@ func (ss *ShardStatus) IsClaimRequestExpired(kclConfig *config.KinesisClientLibC
 		return leaseTimeout.
 			Before(time.Now().UTC().Add(time.Duration(-kclConfig.LeaseStealingClaimTimeoutMillis) * time.Millisecond))
 	}
+}
+
+func (ss *ShardStatus) GetStickyOwner() string {
+	ss.Mux.RLock()
+	defer ss.Mux.RUnlock()
+	return ss.StickyOwner
+}
+
+func (ss *ShardStatus) SetStickyOwner(owner string) {
+	ss.Mux.Lock()
+	defer ss.Mux.Unlock()
+	ss.StickyOwner = owner
 }
