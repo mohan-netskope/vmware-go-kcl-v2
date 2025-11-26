@@ -299,31 +299,48 @@ func (checkpointer *DynamoCheckpoint) GetLease(shard *par.ShardStatus, newAssign
 // CheckpointSequence writes a checkpoint at the designated sequence ID
 func (checkpointer *DynamoCheckpoint) CheckpointSequence(shard *par.ShardStatus) error {
 	leaseTimeout := shard.GetLeaseTimeout().UTC().Format(time.RFC3339Nano)
-	marshalledCheckpoint := map[string]types.AttributeValue{
-		LeaseKeyKey: &types.AttributeValueMemberS{
-			Value: shard.ID,
-		},
-		SequenceNumberKey: &types.AttributeValueMemberS{
-			Value: shard.GetCheckpoint(),
-		},
-		LeaseOwnerKey: &types.AttributeValueMemberS{
-			Value: shard.GetLeaseOwner(),
-		},
-		LeaseTimeoutKey: &types.AttributeValueMemberS{
-			Value: leaseTimeout,
-		},
+
+	// Use UpdateItem to preserve other fields like StickyOwner
+	updateExpression := "SET #cp = :cp, #at = :at, #lt = :lt"
+	expressionAttributeNames := map[string]string{
+		"#cp": SequenceNumberKey,
+		"#at": LeaseOwnerKey,
+		"#lt": LeaseTimeoutKey,
+	}
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":cp": &types.AttributeValueMemberS{Value: shard.GetCheckpoint()},
+		":at": &types.AttributeValueMemberS{Value: shard.GetLeaseOwner()},
+		":lt": &types.AttributeValueMemberS{Value: leaseTimeout},
 	}
 
 	if len(shard.ParentShardId) > 0 {
-		marshalledCheckpoint[ParentShardIdKey] = &types.AttributeValueMemberS{Value: shard.ParentShardId}
+		updateExpression += ", #ps = :ps"
+		expressionAttributeNames["#ps"] = ParentShardIdKey
+		expressionAttributeValues[":ps"] = &types.AttributeValueMemberS{Value: shard.ParentShardId}
 	}
 
-	// Preserve StickyOwner if present
+	// If we have a sticky owner in memory, ensure it's persisted.
+	// If we don't (empty), we leave the existing value in DynamoDB alone (don't overwrite/remove it).
 	if stickyOwner := shard.GetStickyOwner(); stickyOwner != "" {
-		marshalledCheckpoint[StickyOwnerKey] = &types.AttributeValueMemberS{Value: stickyOwner}
+		updateExpression += ", #so = :so"
+		expressionAttributeNames["#so"] = StickyOwnerKey
+		expressionAttributeValues[":so"] = &types.AttributeValueMemberS{Value: stickyOwner}
 	}
 
-	return checkpointer.saveItem(marshalledCheckpoint)
+	input := &dynamodb.UpdateItemInput{
+		TableName: aws.String(checkpointer.TableName),
+		Key: map[string]types.AttributeValue{
+			LeaseKeyKey: &types.AttributeValueMemberS{
+				Value: shard.ID,
+			},
+		},
+		UpdateExpression:          aws.String(updateExpression),
+		ExpressionAttributeNames:  expressionAttributeNames,
+		ExpressionAttributeValues: expressionAttributeValues,
+	}
+
+	_, err := checkpointer.svc.UpdateItem(context.Background(), input)
+	return err
 }
 
 // FetchCheckpoint retrieves the checkpoint for the given shard
