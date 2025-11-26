@@ -43,6 +43,7 @@ const (
 	SequenceNumberKey = "Checkpoint"
 	ParentShardIdKey  = "ParentShardId"
 	ClaimRequestKey   = "ClaimRequest"
+	StickyOwnerKey    = "StickyOwner"
 
 	// ShardEnd We've completely processed all records in this shard.
 	ShardEnd = "SHARD_END"
@@ -87,6 +88,9 @@ type Checkpointer interface {
 
 	// ClaimShard claims a shard for stealing
 	ClaimShard(*par.ShardStatus, string) error
+
+	// GetStickyOwner returns the sticky owner for the given shard
+	GetStickyOwner(string) (string, error)
 }
 
 // ErrSequenceIDNotFound is returned by FetchCheckpoint when no SequenceID is found
