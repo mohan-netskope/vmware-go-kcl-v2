@@ -30,6 +30,7 @@ package checkpoint
 
 import (
 	"context"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -41,6 +42,9 @@ type mockDynamoDB struct {
 	item                      map[string]types.AttributeValue
 	conditionalExpression     string
 	expressionAttributeValues map[string]types.AttributeValue
+	shouldFailConditional     bool
+	updateItemCalled          bool
+	lastUpdateInput           *dynamodb.UpdateItemInput
 }
 
 func (m *mockDynamoDB) Scan(ctx context.Context, params *dynamodb.ScanInput, optFns ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
@@ -61,6 +65,13 @@ func (m *mockDynamoDB) CreateTable(ctx context.Context, params *dynamodb.CreateT
 
 func (m *mockDynamoDB) PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
 	item := params.Item
+
+	// Check for conditional check failure
+	if m.shouldFailConditional && params.ConditionExpression != nil {
+		return nil, &types.ConditionalCheckFailedException{
+			Message: aws.String("Conditional check failed"),
+		}
+	}
 
 	if shardID, ok := item[LeaseKeyKey]; ok {
 		m.item[LeaseKeyKey] = shardID
@@ -102,6 +113,16 @@ func (m *mockDynamoDB) GetItem(ctx context.Context, params *dynamodb.GetItemInpu
 }
 
 func (m *mockDynamoDB) UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	m.updateItemCalled = true
+	m.lastUpdateInput = params
+
+	// Check for conditional check failure
+	if m.shouldFailConditional && params.ConditionExpression != nil {
+		return nil, &types.ConditionalCheckFailedException{
+			Message: aws.String("Conditional check failed"),
+		}
+	}
+
 	exp := params.UpdateExpression
 
 	if aws.ToString(exp) == "remove "+LeaseOwnerKey {

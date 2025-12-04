@@ -32,9 +32,10 @@ package worker
 import (
 	"context"
 	"errors"
-	log "github.com/sirupsen/logrus"
 	"math"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
@@ -315,7 +316,13 @@ func (sc *PollingShardConsumer) renewLease(ctx context.Context) error {
 			log.Debugf("Refreshing lease on shard: %s for worker: %s", sc.shard.ID, sc.consumerID)
 			err := sc.checkpointer.GetLease(sc.shard, sc.consumerID)
 			if err != nil {
-				// log and return error
+				// Check if we lost the lease to another worker
+				if errors.As(err, &chk.ErrLeaseNotAcquired{}) {
+					log.Warnf("Failed to renew lease on shard: %s for worker: %s. Lease likely acquired by another worker.",
+						sc.shard.ID, sc.consumerID)
+					return nil
+				}
+				// Other errors are fatal
 				log.Errorf("Error in refreshing lease on shard: %s for worker: %s. Error: %+v",
 					sc.shard.ID, sc.consumerID, err)
 				return err

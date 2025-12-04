@@ -279,33 +279,89 @@ func (checkpointer *DynamoCheckpoint) GetLease(shard *par.ShardStatus, newAssign
 }
 
 // CheckpointSequence writes a checkpoint at the designated sequence ID
+// This function now uses UpdateItem with a conditional check to prevent race conditions
+// where a worker that has lost ownership can overwrite the current owner's lease
 func (checkpointer *DynamoCheckpoint) CheckpointSequence(shard *par.ShardStatus) error {
-	leaseTimeout := shard.GetLeaseTimeout().UTC().Format(time.RFC3339Nano)
-	marshalledCheckpoint := map[string]types.AttributeValue{
-		LeaseKeyKey: &types.AttributeValueMemberS{
-			Value: shard.ID,
-		},
-		SequenceNumberKey: &types.AttributeValueMemberS{
-			Value: shard.GetCheckpoint(),
-		},
-		LeaseOwnerKey: &types.AttributeValueMemberS{
-			Value: shard.GetLeaseOwner(),
-		},
-		LeaseTimeoutKey: &types.AttributeValueMemberS{
-			Value: leaseTimeout,
-		},
+	leaseTimeout := shard.GetLeaseTimeout()
+	currentOwner := shard.GetLeaseOwner()
+
+	// Validate inputs to prevent writing invalid data
+	if leaseTimeout.IsZero() {
+		checkpointer.log.Warnf("Invalid lease timeout (zero time) for shard %s", shard.ID)
+		return fmt.Errorf("invalid lease timeout for shard %s", shard.ID)
 	}
 
+	if currentOwner == "" {
+		checkpointer.log.Warnf("Invalid lease owner (empty) for shard %s", shard.ID)
+		return fmt.Errorf("invalid lease owner for shard %s", shard.ID)
+	}
+
+	leaseTimeoutStr := leaseTimeout.UTC().Format(time.RFC3339Nano)
+
+	// Build update expression using UpdateItem to preserve fields not being updated
+	updateExpression := "SET #cp = :cp, #at = :at, #lt = :lt"
+	expressionAttributeNames := map[string]string{
+		"#cp": SequenceNumberKey,
+		"#at": LeaseOwnerKey,
+		"#lt": LeaseTimeoutKey,
+	}
+	expressionAttributeValues := map[string]types.AttributeValue{
+		":cp": &types.AttributeValueMemberS{Value: shard.GetCheckpoint()},
+		":at": &types.AttributeValueMemberS{Value: currentOwner},
+		":lt": &types.AttributeValueMemberS{Value: leaseTimeoutStr},
+		// Add current owner for conditional check
+		":current_owner": &types.AttributeValueMemberS{Value: currentOwner},
+	}
+
+	// Include parent shard ID if present
 	if len(shard.ParentShardId) > 0 {
-		marshalledCheckpoint[ParentShardIdKey] = &types.AttributeValueMemberS{Value: shard.ParentShardId}
+		updateExpression += ", #ps = :ps"
+		expressionAttributeNames["#ps"] = ParentShardIdKey
+		expressionAttributeValues[":ps"] = &types.AttributeValueMemberS{Value: shard.ParentShardId}
 	}
 
-	// Preserve StickyOwner if present
+	// Preserve StickyOwner if present in memory
+	// Only update if we have a value - don't overwrite existing DynamoDB value with empty
 	if stickyOwner := shard.GetStickyOwner(); stickyOwner != "" {
-		marshalledCheckpoint[StickyOwnerKey] = &types.AttributeValueMemberS{Value: stickyOwner}
+		updateExpression += ", #so = :so"
+		expressionAttributeNames["#so"] = StickyOwnerKey
+		expressionAttributeValues[":so"] = &types.AttributeValueMemberS{Value: stickyOwner}
 	}
 
-	return checkpointer.saveItem(marshalledCheckpoint)
+	input := &dynamodb.UpdateItemInput{
+		TableName: aws.String(checkpointer.TableName),
+		Key: map[string]types.AttributeValue{
+			LeaseKeyKey: &types.AttributeValueMemberS{
+				Value: shard.ID,
+			},
+		},
+		UpdateExpression:          aws.String(updateExpression),
+		ExpressionAttributeNames:  expressionAttributeNames,
+		ExpressionAttributeValues: expressionAttributeValues,
+		// CRITICAL FIX: Add conditional check to ensure we still own the lease
+		// This prevents race conditions where another worker has taken the lease
+		ConditionExpression: aws.String("AssignedTo = :current_owner OR attribute_not_exists(AssignedTo)"),
+	}
+
+	checkpointer.log.Debugf("Checkpointing shard %s: checkpoint=%s, owner=%s, stickyOwner=%s",
+		shard.ID, shard.GetCheckpoint(), currentOwner, shard.GetStickyOwner())
+
+	_, err := checkpointer.svc.UpdateItem(context.Background(), input)
+
+	// Handle conditional check failure (lost ownership)
+	if err != nil {
+		var conditionalCheckErr *types.ConditionalCheckFailedException
+		if errors.As(err, &conditionalCheckErr) {
+			checkpointer.log.Warnf("Lost ownership of shard %s during checkpoint, cannot update. "+
+				"Another worker has likely taken the lease.", shard.ID)
+			return ErrLeaseNotAcquired{"lost lease ownership during checkpoint"}
+		}
+		checkpointer.log.Errorf("Failed to checkpoint shard %s: %v", shard.ID, err)
+		return err
+	}
+
+	checkpointer.log.Debugf("Successfully checkpointed shard %s at sequence %s", shard.ID, shard.GetCheckpoint())
+	return nil
 }
 
 // FetchCheckpoint retrieves the checkpoint for the given shard
