@@ -144,35 +144,17 @@ func (checkpointer *DynamoCheckpoint) GetLease(shard *par.ShardStatus, newAssign
 		stickyOwner := stickyOwnerVar.(*types.AttributeValueMemberS).Value
 		if stickyOwner != "" && stickyOwner != newAssignTo {
 			// This shard has a sticky owner and it's not the current worker
-			// Check if this is a lease renewal by a temporary holder
+			// Check if this is a lease renewal by a temporary holder(~non sticky owner)
 			assignedVar, assignedToOk := currentCheckpoint[LeaseOwnerKey]
 			if assignedToOk {
 				currentAssignee := assignedVar.(*types.AttributeValueMemberS).Value
 				if currentAssignee == newAssignTo {
-					// This is a temporary holder trying to renew the lease
+					// This is a temporary holder(~non sticky owner) trying to renew the lease
 					// Don't allow renewal - let the lease expire so sticky owner can reclaim
-					checkpointer.log.Infof("Shard %s is sticky to worker %s. Temporary holder %s will not renew lease to allow sticky owner to reclaim",
+					checkpointer.log.Infof("Shard %s is sticky to worker %s. Temporary holder(~non sticky owner) %s will not renew lease to allow sticky owner to reclaim",
 						shard.ID, stickyOwner, newAssignTo)
-					return ErrLeaseNotAcquired{"temporary holder cannot renew lease for shard with sticky owner"}
+					return ErrLeaseNotAcquired{"temporary holder(~non sticky owner) cannot renew lease for shard with sticky owner"}
 				}
-			}
-
-			// Check if the sticky owner's lease has expired beyond FailoverTimeMillis
-			leaseVar, leaseTimeoutOk := currentCheckpoint[LeaseTimeoutKey]
-			if leaseTimeoutOk {
-				leaseTimeout := leaseVar.(*types.AttributeValueMemberS).Value
-				currentLeaseTimeout, err := time.Parse(time.RFC3339Nano, leaseTimeout)
-				if err != nil {
-					return err
-				}
-				// Allow temporary takeover only if lease has been expired for the full failover time
-				if time.Now().UTC().Before(currentLeaseTimeout) {
-					checkpointer.log.Debugf("Shard %s is sticky to worker %s (lease not expired). Denying lease to %s",
-						shard.ID, stickyOwner, newAssignTo)
-					return ErrLeaseNotAcquired{"shard has sticky owner with active lease"}
-				}
-				checkpointer.log.Warnf("Shard %s is sticky to worker %s but lease expired. Allowing temporary takeover by %s",
-					shard.ID, stickyOwner, newAssignTo)
 			}
 		}
 	}
