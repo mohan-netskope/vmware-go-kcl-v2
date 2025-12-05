@@ -575,6 +575,7 @@ func (checkpointer *DynamoCheckpoint) syncLeases(shardStatus map[string]*par.Sha
 		ProjectionExpression: aws.String(fmt.Sprintf("%s,%s,%s,%s", LeaseKeyKey, LeaseOwnerKey, SequenceNumberKey, StickyOwnerKey)),
 		Select:               "SPECIFIC_ATTRIBUTES",
 		TableName:            aws.String(checkpointer.kclConfig.TableName),
+		ConsistentRead:       aws.Bool(true),
 	}
 
 	scanOutput, err := checkpointer.svc.Scan(context.TODO(), input)
