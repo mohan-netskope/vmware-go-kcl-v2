@@ -665,6 +665,16 @@ func (checkpointer *DynamoCheckpoint) putItem(input *dynamodb.PutItemInput) erro
 }
 
 func (checkpointer *DynamoCheckpoint) getItem(shardID string) (map[string]types.AttributeValue, error) {
+	if !checkpointer.kclConfig.EnableRepeatableRead {
+		// Standard single read with strong consistency
+		return checkpointer.getItemSingle(shardID)
+	}
+
+	// Repeatable read: read multiple times and verify consistency
+	return checkpointer.getItemRepeatable(shardID)
+}
+
+func (checkpointer *DynamoCheckpoint) getItemSingle(shardID string) (map[string]types.AttributeValue, error) {
 	item, err := checkpointer.svc.GetItem(context.Background(), &dynamodb.GetItemInput{
 		TableName:      aws.String(checkpointer.TableName),
 		ConsistentRead: aws.Bool(true),
@@ -681,6 +691,115 @@ func (checkpointer *DynamoCheckpoint) getItem(shardID string) (map[string]types.
 	}
 
 	return item.Item, err
+}
+
+func (checkpointer *DynamoCheckpoint) getItemRepeatable(shardID string) (map[string]types.AttributeValue, error) {
+	log := checkpointer.kclConfig.Logger
+	attempts := checkpointer.kclConfig.RepeatableReadAttempts
+	if attempts < 2 {
+		attempts = 2 // Minimum 2 reads for verification
+	}
+
+	var lastRead map[string]types.AttributeValue
+	var lastErr error
+
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			// Sleep between reads to allow any pending writes to complete
+			time.Sleep(time.Duration(checkpointer.kclConfig.RepeatableReadDelayMillis) * time.Millisecond)
+		}
+
+		item, err := checkpointer.svc.GetItem(context.Background(), &dynamodb.GetItemInput{
+			TableName:      aws.String(checkpointer.TableName),
+			ConsistentRead: aws.Bool(true),
+			Key: map[string]types.AttributeValue{
+				LeaseKeyKey: &types.AttributeValueMemberS{
+					Value: shardID,
+				},
+			},
+		})
+
+		if err != nil {
+			log.Warnf("Repeatable read attempt %d/%d failed for shard %s: %v", i+1, attempts, shardID, err)
+			lastErr = err
+			continue
+		}
+
+		if item == nil {
+			return nil, err
+		}
+
+		currentRead := item.Item
+
+		// First read - store as baseline
+		if i == 0 {
+			lastRead = currentRead
+			continue
+		}
+
+		// Compare with previous read
+		if checkpointer.areItemsEqual(lastRead, currentRead, shardID) {
+			// Values are consistent across reads - return the latest
+			log.Debugf("Repeatable read verification passed for shard %s after %d reads", shardID, i+1)
+			return currentRead, nil
+		}
+
+		// Values differ - continue reading
+		log.Warnf("Repeatable read inconsistency detected for shard %s at attempt %d/%d", shardID, i+1, attempts)
+		lastRead = currentRead
+	}
+
+	// After all attempts, return the last successful read
+	if lastRead != nil {
+		log.Warnf("Repeatable read completed for shard %s after %d attempts, using latest read", shardID, attempts)
+		return lastRead, nil
+	}
+
+	return nil, lastErr
+}
+
+// areItemsEqual compares two DynamoDB items for equality on critical lease fields
+func (checkpointer *DynamoCheckpoint) areItemsEqual(item1, item2 map[string]types.AttributeValue, shardID string) bool {
+	if item1 == nil && item2 == nil {
+		return true
+	}
+	if item1 == nil || item2 == nil {
+		return false
+	}
+
+	// Compare critical fields for lease management
+	criticalFields := []string{LeaseOwnerKey, LeaseTimeoutKey, SequenceNumberKey, StickyOwnerKey, ClaimRequestKey}
+
+	for _, field := range criticalFields {
+		val1, ok1 := item1[field]
+		val2, ok2 := item2[field]
+
+		// If field exists in one but not the other
+		if ok1 != ok2 {
+			checkpointer.log.Debugf("Field %s existence mismatch for shard %s", field, shardID)
+			return false
+		}
+
+		// If field exists in both, compare values
+		if ok1 && ok2 {
+			str1 := ""
+			str2 := ""
+
+			if memberS1, ok := val1.(*types.AttributeValueMemberS); ok {
+				str1 = memberS1.Value
+			}
+			if memberS2, ok := val2.(*types.AttributeValueMemberS); ok {
+				str2 = memberS2.Value
+			}
+
+			if str1 != str2 {
+				checkpointer.log.Debugf("Field %s value mismatch for shard %s: '%s' vs '%s'", field, shardID, str1, str2)
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 func (checkpointer *DynamoCheckpoint) removeItem(shardID string) error {

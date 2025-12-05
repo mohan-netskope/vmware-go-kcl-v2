@@ -104,6 +104,9 @@ func NewKinesisClientLibConfigWithCredentials(applicationName, streamName, regio
 		LeaseSyncingTimeIntervalMillis:                   DefaultLeaseSyncingIntervalMillis,
 		LeaseRefreshWaitTime:                             DefaultLeaseRefreshWaitTime,
 		MaxRetryCount:                                    DefaultMaxRetryCount,
+		EnableRepeatableRead:                             DefaultEnableRepeatableRead,
+		RepeatableReadAttempts:                           DefaultRepeatableReadAttempts,
+		RepeatableReadDelayMillis:                        DefaultRepeatableReadDelayMillis,
 		Logger:                                           logger.GetDefaultLogger(),
 	}
 }
@@ -274,5 +277,25 @@ func (c *KinesisClientLibConfiguration) WithLeaseStealingIntervalMillis(leaseSte
 
 func (c *KinesisClientLibConfiguration) WithLeaseSyncingIntervalMillis(leaseSyncingIntervalMillis int) *KinesisClientLibConfiguration {
 	c.LeaseSyncingTimeIntervalMillis = leaseSyncingIntervalMillis
+	return c
+}
+
+// WithRepeatableRead enables or disables repeatable read for strict consistency
+func (c *KinesisClientLibConfiguration) WithRepeatableRead(enable bool) *KinesisClientLibConfiguration {
+	c.EnableRepeatableRead = enable
+	return c
+}
+
+// WithRepeatableReadAttempts sets the number of read attempts for repeatable read verification
+func (c *KinesisClientLibConfiguration) WithRepeatableReadAttempts(attempts int) *KinesisClientLibConfiguration {
+	checkIsValuePositive("RepeatableReadAttempts", attempts)
+	c.RepeatableReadAttempts = attempts
+	return c
+}
+
+// WithRepeatableReadDelayMillis sets the delay between repeatable read attempts in milliseconds
+func (c *KinesisClientLibConfiguration) WithRepeatableReadDelayMillis(delayMillis int) *KinesisClientLibConfiguration {
+	checkIsValuePositive("RepeatableReadDelayMillis", delayMillis)
+	c.RepeatableReadDelayMillis = delayMillis
 	return c
 }

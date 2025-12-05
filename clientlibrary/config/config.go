@@ -142,6 +142,15 @@ const (
 
 	// DefaultMaxRetryCount The default maximum number of retries in case of error
 	DefaultMaxRetryCount = 5
+
+	// DefaultEnableRepeatableRead Enable reading DynamoDB data multiple times to ensure strict consistency
+	DefaultEnableRepeatableRead = true
+
+	// DefaultRepeatableReadAttempts Number of times to read DynamoDB data for verification
+	DefaultRepeatableReadAttempts = 5
+
+	// DefaultRepeatableReadDelayMillis Delay in milliseconds between repeatable read attempts
+	DefaultRepeatableReadDelayMillis = 1000
 )
 
 type (
@@ -295,6 +304,15 @@ type (
 
 		// MaxRetryCount The maximum number of retries in case of error
 		MaxRetryCount int
+
+		// EnableRepeatableRead enables reading DynamoDB data multiple times for strict consistency
+		EnableRepeatableRead bool
+
+		// RepeatableReadAttempts is the number of times to read data for verification
+		RepeatableReadAttempts int
+
+		// RepeatableReadDelayMillis is the delay between read attempts in milliseconds
+		RepeatableReadDelayMillis int
 	}
 )
 
